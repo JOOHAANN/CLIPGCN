@@ -1,0 +1,47 @@
+# Large/generated datasets
+data/
+
+# Training/evaluation outputs
+work_dir/
+outputs/
+output/
+runs/
+logs/
+wandb/
+tensorboard/
+
+# Model checkpoints and serialized arrays
+*.pth
+*.pt
+*.ckpt
+*.onnx
+*.npy
+*.npz
+*.pkl
+*.pickle
+*.h5
+*.hdf5
+
+# Archives and large media/data exports
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.rar
+*.7z
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.csv
+
+# Python/cache artifacts
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.pytest_cache/
+
+# Local/editor files
+.DS_Store
+.vscode/
+*.log
