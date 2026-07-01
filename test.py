@@ -38,6 +38,15 @@ def load_split_classes(split_dir, scope):
     raise ValueError(f"Unsupported candidate scope: {scope}")
 
 
+def load_split_metadata(split_dir):
+    metadata_path = Path(split_dir) / "metadata.json"
+    if not metadata_path.exists():
+        return {}
+
+    with open(metadata_path, "r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
 def load_latest_run_info(config, config_path):
     output_config = config.get("outputs", {})
     work_dir = output_config.get("work_dir")
@@ -97,14 +106,57 @@ def load_model(config, config_path, device, checkpoint_path):
     return model
 
 
-def evaluate(model, data_loader, candidate_labels, device, use_amp=False):
+def logits_to_unit_cosine_scores(model, logits):
+    logit_scale = getattr(model, "logit_scale", None)
+    if logit_scale is None:
+        raise AttributeError("Model does not expose logit_scale, cannot recover cosine scores.")
+
+    scale = logit_scale.exp().clamp(max=100).to(device=logits.device, dtype=logits.dtype)
+    cosine_scores = (logits / scale).clamp(-1.0, 1.0)
+    return (cosine_scores + 1.0) * 0.5
+
+
+def build_label_mask(candidate_labels, selected_labels, device):
+    selected = {int(label) for label in selected_labels}
+    return torch.as_tensor(
+        [int(label) in selected for label in candidate_labels],
+        dtype=torch.bool,
+        device=device,
+    )
+
+
+def apply_unseen_score_scale(model, logits, candidate_labels, unseen_labels, unseen_score_scale):
+    if unseen_score_scale == 1.0 or not unseen_labels:
+        return logits, False
+
+    unseen_mask = build_label_mask(candidate_labels, unseen_labels, logits.device)
+    if not torch.any(unseen_mask):
+        return logits, False
+
+    # Use non-negative confidence-like scores before scaling unseen classes.
+    scaled_scores = logits_to_unit_cosine_scores(model, logits)
+    scaled_scores[:, unseen_mask] *= unseen_score_scale
+    return scaled_scores, True
+
+
+def evaluate(model, data_loader, candidate_labels, device, use_amp=False, unseen_labels=None, unseen_score_scale=1.0):
     candidate_tensor = torch.as_tensor(candidate_labels, dtype=torch.long, device=device)
+    unseen_labels = unseen_labels or []
     total = 0
     correct1 = 0
     correct5 = 0
     loss_sum = 0.0
     inference_time_seconds = 0.0
     predictions = []
+    used_unseen_score_scale = False
+    per_class = {
+        int(label): {
+            "num_samples": 0,
+            "top1_correct": 0,
+            "top5_correct": 0,
+        }
+        for label in candidate_labels
+    }
 
     with torch.no_grad():
         for batch in progress_bar(data_loader, "Test"):
@@ -124,21 +176,51 @@ def evaluate(model, data_loader, candidate_labels, device, use_amp=False):
                 torch.cuda.synchronize(device)
             inference_time_seconds += time.perf_counter() - start_time
 
-            pred_indices = torch.argmax(logits, dim=1)
+            prediction_scores, batch_used_scale = apply_unseen_score_scale(
+                model,
+                logits,
+                candidate_labels,
+                unseen_labels=unseen_labels,
+                unseen_score_scale=unseen_score_scale,
+            )
+            used_unseen_score_scale = used_unseen_score_scale or batch_used_scale
+
+            pred_indices = torch.argmax(prediction_scores, dim=1)
             pred_labels = candidate_tensor[pred_indices]
             labels = batch["label"].long()
             targets = model.build_target_indices(labels)
             loss = F.cross_entropy(logits.float(), targets)
-            correct1 += int((pred_labels == labels).sum().item())
+            top1_correct_mask = pred_labels == labels
+            correct1 += int(top1_correct_mask.sum().item())
 
-            if logits.shape[1] >= 5:
-                top5_indices = torch.topk(logits, k=5, dim=1).indices
+            top5_correct_mask = None
+            if prediction_scores.shape[1] >= 5:
+                top5_indices = torch.topk(prediction_scores, k=5, dim=1).indices
                 top5_labels = candidate_tensor[top5_indices]
-                correct5 += int((top5_labels == labels[:, None]).any(dim=1).sum().item())
+                top5_correct_mask = (top5_labels == labels[:, None]).any(dim=1)
+                correct5 += int(top5_correct_mask.sum().item())
 
             batch_size = labels.shape[0]
             total += batch_size
             loss_sum += float(loss.detach().cpu()) * batch_size
+            label_list = labels.detach().cpu().tolist()
+            top1_correct_list = top1_correct_mask.detach().cpu().tolist()
+            top5_correct_list = (
+                top5_correct_mask.detach().cpu().tolist()
+                if top5_correct_mask is not None
+                else [False] * batch_size
+            )
+            for label, is_top1_correct, is_top5_correct in zip(label_list, top1_correct_list, top5_correct_list):
+                label = int(label)
+                if label not in per_class:
+                    per_class[label] = {
+                        "num_samples": 0,
+                        "top1_correct": 0,
+                        "top5_correct": 0,
+                    }
+                per_class[label]["num_samples"] += 1
+                per_class[label]["top1_correct"] += int(is_top1_correct)
+                per_class[label]["top5_correct"] += int(is_top5_correct)
             predictions.extend(
                 {
                     "label": int(label),
@@ -147,12 +229,41 @@ def evaluate(model, data_loader, candidate_labels, device, use_amp=False):
                 for label, pred in zip(labels.detach().cpu().tolist(), pred_labels.detach().cpu().tolist())
             )
 
+    per_class_accuracy = {}
+    for label in sorted(per_class):
+        stats = per_class[label]
+        num_samples = stats["num_samples"]
+        per_class_accuracy[str(label)] = {
+            "num_samples": num_samples,
+            "top1_correct": stats["top1_correct"],
+            "top1_acc": stats["top1_correct"] / num_samples if num_samples else None,
+            "top5_correct": stats["top5_correct"] if len(candidate_labels) >= 5 else None,
+            "top5_acc": (
+                stats["top5_correct"] / num_samples
+                if len(candidate_labels) >= 5 and num_samples
+                else None
+            ),
+        }
+    observed_class_acc = [
+        value["top1_acc"]
+        for value in per_class_accuracy.values()
+        if value["num_samples"] > 0 and value["top1_acc"] is not None
+    ]
+
     metrics = {
         "num_samples": total,
         "loss": loss_sum / max(total, 1),
         "top1_acc": correct1 / max(total, 1),
         "top5_acc": correct5 / max(total, 1) if len(candidate_labels) >= 5 else None,
+        "macro_top1_acc": sum(observed_class_acc) / len(observed_class_acc) if observed_class_acc else None,
+        "per_class_accuracy": per_class_accuracy,
         "candidate_labels": [int(label) for label in candidate_labels],
+        "score_calibration": {
+            "enabled": used_unseen_score_scale,
+            "method": "unit_cosine_unseen_scale" if used_unseen_score_scale else "none",
+            "unseen_labels": [int(label) for label in unseen_labels],
+            "unseen_score_scale": float(unseen_score_scale),
+        },
         "inference_time_seconds": inference_time_seconds,
         "avg_inference_time_seconds_per_sample": inference_time_seconds / max(total, 1),
         "avg_inference_time_ms_per_sample": (inference_time_seconds / max(total, 1)) * 1000.0,
@@ -166,6 +277,11 @@ def parse_args():
     parser.add_argument("--config", default="config.yaml", help="Path to CLIPGCN YAML config.")
     parser.add_argument("--checkpoint", default=None, help="Model checkpoint. Defaults to outputs.best_model.")
     parser.add_argument("--split-dir", default=None, help="Directory containing unseen_*.npy. Defaults to data.train.data_dir.")
+    parser.add_argument(
+        "--class-split-dir",
+        default=None,
+        help="Directory whose metadata.json defines seen/unseen classes. Defaults to --split-dir.",
+    )
     parser.add_argument("--prefix", default="unseen", help="Dataset prefix, usually unseen.")
     parser.add_argument(
         "--candidate-scope",
@@ -176,6 +292,12 @@ def parse_args():
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--output", default=None, help="Optional JSON output path.")
+    parser.add_argument(
+        "--unseen-score-scale",
+        type=float,
+        default=1.0,
+        help="Multiplier applied to unseen class confidence scores before top-k prediction.",
+    )
     return parser.parse_args()
 
 
@@ -195,8 +317,14 @@ def main():
         checkpoint_path = get_path_from_config(config_path, config["outputs"]["best_model"])
     split_dir = args.split_dir or get_path_from_config(config_path, config["data"]["train"]["data_dir"])
     split_dir = get_path_from_config(config_path, split_dir)
+    class_split_dir = args.class_split_dir or split_dir
+    class_split_dir = get_path_from_config(config_path, class_split_dir)
 
-    candidate_labels = load_split_classes(split_dir, args.candidate_scope)
+    if args.unseen_score_scale <= 0:
+        raise ValueError("--unseen-score-scale must be positive.")
+
+    split_metadata = load_split_metadata(class_split_dir)
+    candidate_labels = load_split_classes(class_split_dir, args.candidate_scope)
     model = load_model(config, config_path, device, checkpoint_path)
     candidate_labels, _texts = build_text_bank(model, config, config_path, candidate_labels)
 
@@ -216,19 +344,43 @@ def main():
     )
 
     use_amp = bool(config["runtime"].get("amp", False)) and device.type == "cuda"
-    metrics, predictions = evaluate(model, data_loader, candidate_labels, device, use_amp=use_amp)
+    unseen_labels = split_metadata.get("unseen_classes", [])
+    if args.unseen_score_scale != 1.0 and not unseen_labels:
+        print("Warning: --unseen-score-scale was set, but class metadata has no unseen_classes.")
+    metrics, predictions = evaluate(
+        model,
+        data_loader,
+        candidate_labels,
+        device,
+        use_amp=use_amp,
+        unseen_labels=unseen_labels,
+        unseen_score_scale=args.unseen_score_scale,
+    )
 
     print("Unseen action recognition results")
     print(f"  checkpoint: {checkpoint_path}")
     print(f"  split_dir: {split_dir}")
+    print(f"  class_split_dir: {class_split_dir}")
     print(f"  prefix: {args.prefix}")
     print(f"  candidate_scope: {args.candidate_scope}")
     print(f"  candidate_labels: {metrics['candidate_labels']}")
+    print(f"  score_calibration: {metrics['score_calibration']}")
     print(f"  num_samples: {metrics['num_samples']}")
     print(f"  loss: {metrics['loss']:.4f}")
     print(f"  top1_acc: {metrics['top1_acc']:.4f}")
+    if metrics["macro_top1_acc"] is not None:
+        print(f"  macro_top1_acc: {metrics['macro_top1_acc']:.4f}")
     if metrics["top5_acc"] is not None:
         print(f"  top5_acc: {metrics['top5_acc']:.4f}")
+    print("  per_class_top1_acc:")
+    for label, stats in metrics["per_class_accuracy"].items():
+        if stats["num_samples"] == 0:
+            continue
+        print(
+            f"    class {label}: "
+            f"{stats['top1_acc']:.4f} "
+            f"({stats['top1_correct']}/{stats['num_samples']})"
+        )
     print(f"  total_inference_time: {metrics['inference_time_seconds']:.4f}s")
     print(f"  avg_inference_time: {metrics['avg_inference_time_ms_per_sample']:.4f} ms/sample")
     if metrics["samples_per_second"] is not None:
