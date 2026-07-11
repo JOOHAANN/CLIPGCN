@@ -85,10 +85,16 @@ def build_text_bank(model, config, config_path, candidate_labels):
 
 
 def load_model(config, config_path, device, checkpoint_path):
+    fusion_config = config["model"].get("fusion", {})
     model = build_model(
         text_model_name=config["model"]["text_encoder"]["name"],
         device=device,
         download_root=get_path_from_config(config_path, config["model"]["text_encoder"].get("download_root")),
+        fusion_dropout=float(fusion_config.get("dropout", 0.2)),
+        fusion_reducer=fusion_config.get("reducer", "flatten_fc"),
+        fusion_attention_dim=int(fusion_config.get("attention_dim", 256)),
+        fusion_attention_heads=int(fusion_config.get("attention_heads", 4)),
+        fusion_attention_layers=int(fusion_config.get("attention_layers", 2)),
     )
 
     if not os.path.exists(checkpoint_path):
@@ -272,17 +278,92 @@ def evaluate(model, data_loader, candidate_labels, device, use_amp=False, unseen
     return metrics, predictions
 
 
+def build_eval_dataset(split_dir, prefixes):
+    datasets = [
+        TrimodalContrastiveDataset(
+            data_dir=split_dir,
+            prefix=prefix,
+            mmap=True,
+        )
+        for prefix in prefixes
+    ]
+    if len(datasets) == 1:
+        return datasets[0]
+    return Data.ConcatDataset(datasets)
+
+
+def get_dataset_labels(dataset):
+    if isinstance(dataset, Data.Subset):
+        labels = get_dataset_labels(dataset.dataset)
+        return labels[np.asarray(dataset.indices, dtype=np.int64)]
+    if isinstance(dataset, Data.ConcatDataset):
+        return np.concatenate([get_dataset_labels(child) for child in dataset.datasets])
+    if hasattr(dataset, "labels"):
+        return np.asarray(dataset.labels)
+    raise TypeError(f"Cannot extract labels from dataset type: {type(dataset).__name__}")
+
+
+def filter_dataset_by_sample_scope(dataset, sample_scope, split_metadata):
+    if sample_scope == "all":
+        return dataset
+
+    class_key = f"{sample_scope}_classes"
+    if class_key not in split_metadata:
+        raise KeyError(
+            f"class metadata does not define {class_key}; "
+            "pass --class-split-dir pointing to the 50/5 split metadata."
+        )
+
+    allowed = {int(label) for label in split_metadata[class_key]}
+    labels = get_dataset_labels(dataset)
+    indices = [index for index, label in enumerate(labels) if int(label) in allowed]
+    if not indices:
+        raise ValueError(f"--sample-scope {sample_scope} selected zero samples.")
+    return Data.Subset(dataset, indices)
+
+
+def validate_candidate_coverage(dataset, candidate_labels, candidate_scope):
+    if candidate_labels is None:
+        return
+
+    labels = get_dataset_labels(dataset)
+    candidate_set = {int(label) for label in candidate_labels}
+    outside = sorted({int(label) for label in np.unique(labels) if int(label) not in candidate_set})
+    if outside:
+        count = int(sum(int(label) not in candidate_set for label in labels))
+        raise ValueError(
+            f"{count} evaluated samples have labels outside --candidate-scope {candidate_scope}: {outside}. "
+            "Use --sample-scope to filter samples, or use --candidate-scope all."
+        )
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate CLIPGCN zero-shot action recognition.")
     parser.add_argument("--config", default="config.yaml", help="Path to CLIPGCN YAML config.")
     parser.add_argument("--checkpoint", default=None, help="Model checkpoint. Defaults to outputs.best_model.")
-    parser.add_argument("--split-dir", default=None, help="Directory containing unseen_*.npy. Defaults to data.train.data_dir.")
+    parser.add_argument(
+        "--split-dir",
+        default=None,
+        help="Directory containing <prefix>_video.npy, <prefix>_pose.npy, etc. Defaults to data.train.data_dir.",
+    )
     parser.add_argument(
         "--class-split-dir",
         default=None,
         help="Directory whose metadata.json defines seen/unseen classes. Defaults to --split-dir.",
     )
     parser.add_argument("--prefix", default="unseen", help="Dataset prefix, usually unseen.")
+    parser.add_argument(
+        "--prefixes",
+        nargs="+",
+        default=None,
+        help="Evaluate one or more prefixes concatenated together. Overrides --prefix.",
+    )
+    parser.add_argument(
+        "--sample-scope",
+        choices=["all", "seen", "unseen"],
+        default="all",
+        help="Optionally filter evaluated samples by seen/unseen class metadata.",
+    )
     parser.add_argument(
         "--candidate-scope",
         choices=["unseen", "seen", "all"],
@@ -328,11 +409,10 @@ def main():
     model = load_model(config, config_path, device, checkpoint_path)
     candidate_labels, _texts = build_text_bank(model, config, config_path, candidate_labels)
 
-    dataset = TrimodalContrastiveDataset(
-        data_dir=split_dir,
-        prefix=args.prefix,
-        mmap=True,
-    )
+    prefixes = args.prefixes or [args.prefix]
+    dataset = build_eval_dataset(split_dir, prefixes)
+    dataset = filter_dataset_by_sample_scope(dataset, args.sample_scope, split_metadata)
+    validate_candidate_coverage(dataset, candidate_labels, args.candidate_scope)
     loader_config = config["data"]["dataloader"]
     data_loader = Data.DataLoader(
         dataset,
@@ -357,11 +437,12 @@ def main():
         unseen_score_scale=args.unseen_score_scale,
     )
 
-    print("Unseen action recognition results")
+    print("Action recognition results")
     print(f"  checkpoint: {checkpoint_path}")
     print(f"  split_dir: {split_dir}")
     print(f"  class_split_dir: {class_split_dir}")
-    print(f"  prefix: {args.prefix}")
+    print(f"  prefixes: {prefixes}")
+    print(f"  sample_scope: {args.sample_scope}")
     print(f"  candidate_scope: {args.candidate_scope}")
     print(f"  candidate_labels: {metrics['candidate_labels']}")
     print(f"  score_calibration: {metrics['score_calibration']}")
@@ -399,6 +480,11 @@ def main():
                 {
                     "metrics": metrics,
                     "predictions": predictions,
+                    "prefixes": prefixes,
+                    "sample_scope": args.sample_scope,
+                    "split_dir": split_dir,
+                    "class_split_dir": class_split_dir,
+                    "checkpoint": checkpoint_path,
                 },
                 handle,
                 indent=2,

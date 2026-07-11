@@ -86,7 +86,12 @@ def load_object_dict(path):
 
 
 def load_object_dict_or_backup(path, backup_dir, overwrite):
-    obj = load_object_dict(path)
+    try:
+        obj = load_object_dict(path)
+    except ValueError:
+        if not overwrite:
+            raise
+        obj = None
     if obj is not None:
         return obj, path
     if not overwrite:

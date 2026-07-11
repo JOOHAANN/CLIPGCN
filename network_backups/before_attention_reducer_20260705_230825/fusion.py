@@ -151,98 +151,6 @@ class ADLFeatureReducer(nn.Module):
 
         return x
 
-
-class TokenAttentionADLFeatureReducer(nn.Module):
-    """Reduce fused ADL maps with pooled temporal tokens and self-attention.
-
-    This avoids the old 25,200 -> 512 flatten projection, which can memorize
-    train-subject spatial details too easily. Each temporal slice becomes one
-    token after lightweight spatial encoding and average pooling.
-    """
-
-    def __init__(
-        self,
-        in_channels=50,
-        token_dim=256,
-        output_dim=512,
-        num_layers=2,
-        num_heads=4,
-        max_tokens=16,
-        dropout=0.4,
-    ):
-        super().__init__()
-        if token_dim % num_heads != 0:
-            raise ValueError("token_dim must be divisible by num_heads.")
-
-        self.max_tokens = max_tokens
-        self.frame_encoder = nn.Sequential(
-            nn.Conv3d(
-                in_channels=in_channels,
-                out_channels=token_dim,
-                kernel_size=(1, 3, 3),
-                padding=(0, 1, 1),
-                bias=False,
-            ),
-            nn.BatchNorm3d(token_dim),
-            nn.GELU(),
-            nn.Conv3d(
-                in_channels=token_dim,
-                out_channels=token_dim,
-                kernel_size=(3, 1, 1),
-                padding=(1, 0, 0),
-                groups=token_dim,
-                bias=False,
-            ),
-            nn.BatchNorm3d(token_dim),
-            nn.GELU(),
-        )
-        self.token_norm = nn.LayerNorm(token_dim)
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, token_dim))
-        self.pos_embedding = nn.Parameter(torch.zeros(1, max_tokens + 1, token_dim))
-
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=token_dim,
-            nhead=num_heads,
-            dim_feedforward=token_dim * 4,
-            dropout=dropout,
-            activation="gelu",
-            batch_first=True,
-            norm_first=False,
-        )
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        self.projection = nn.Sequential(
-            nn.LayerNorm(token_dim),
-            nn.Linear(token_dim, output_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(output_dim, output_dim),
-        )
-        self._init_parameters()
-
-    def _init_parameters(self):
-        nn.init.trunc_normal_(self.cls_token, std=0.02)
-        nn.init.trunc_normal_(self.pos_embedding, std=0.02)
-
-    def forward(self, x):
-        if x.ndim != 5:
-            raise ValueError(f"Expected [B,T,C,H,W], got {tuple(x.shape)}")
-
-        batch_size, frames, _channels, _height, _width = x.shape
-        if frames > self.max_tokens:
-            raise ValueError(f"Expected at most {self.max_tokens} temporal tokens, got {frames}")
-
-        x = x.permute(0, 2, 1, 3, 4).contiguous()
-        x = self.frame_encoder(x)
-        tokens = x.mean(dim=(-1, -2)).transpose(1, 2).contiguous()
-        tokens = self.token_norm(tokens)
-
-        cls = self.cls_token.expand(batch_size, -1, -1)
-        tokens = torch.cat([cls, tokens], dim=1)
-        tokens = tokens + self.pos_embedding[:, : frames + 1]
-        tokens = self.encoder(tokens)
-        return self.projection(tokens[:, 0])
-
-
 class PoseADLFeatureExtractor(nn.Module):
     def __init__(self, in_channels=64, grid_size=6):
         super().__init__()
@@ -301,41 +209,20 @@ class TriModalFusion(nn.Module):
     outputs：        
         ADL_embedding: [B, 512]
     """
-    def __init__(
-        self,
-        reducer_dropout: float = 0.2,
-        reducer_type: str = "flatten_fc",
-        attention_dim: int = 256,
-        attention_heads: int = 4,
-        attention_layers: int = 2,
-    ):
+    def __init__(self, reducer_dropout: float = 0.2):
         super().__init__()
 
         # 线性层用于对齐通道数
         self.video_raw_proj = VideoADLFeatureExtractor(in_channels=192, out_channels=25)
         self.pose_raw_proj = PoseADLFeatureExtractor(in_channels=64, grid_size=6)
-        normalized_reducer_type = reducer_type.lower()
-        if normalized_reducer_type in {"flatten_fc", "fc", "legacy"}:
-            self.reducer = ADLFeatureReducer(
-                in_channels=50,
-                spatial_channels=50,
-                temporal_channels=50,
-                output_dim=512,
-                flattened_dim=25200,
-                dropout=reducer_dropout,
-            )
-        elif normalized_reducer_type in {"attention_pool", "token_attention", "attention"}:
-            self.reducer = TokenAttentionADLFeatureReducer(
-                in_channels=50,
-                token_dim=attention_dim,
-                output_dim=512,
-                num_layers=attention_layers,
-                num_heads=attention_heads,
-                max_tokens=16,
-                dropout=reducer_dropout,
-            )
-        else:
-            raise ValueError(f"Unsupported reducer_type: {reducer_type}")
+        self.reducer = ADLFeatureReducer(
+            in_channels=50,
+            spatial_channels=50,
+            temporal_channels=50,
+            output_dim=512,
+            flattened_dim=25200,
+            dropout=reducer_dropout,
+        )
 
     def forward(self, video_feature_raw, pose_feature_raw, object_feature_raw, joint_location_raw):    
         # video_feature_raw: [B, 13, 192, 6, 6]

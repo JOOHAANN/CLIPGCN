@@ -231,22 +231,9 @@ def encode_xlsx_action_descriptions(
 
 
 class TriModalModel(nn.Module):
-    def __init__(
-        self,
-        fusion_dropout: float = 0.2,
-        fusion_reducer: str = "flatten_fc",
-        fusion_attention_dim: int = 256,
-        fusion_attention_heads: int = 4,
-        fusion_attention_layers: int = 2,
-    ):
+    def __init__(self, fusion_dropout: float = 0.2):
         super().__init__()
-        self.fusion_module = TriModalFusion(
-            reducer_dropout=fusion_dropout,
-            reducer_type=fusion_reducer,
-            attention_dim=fusion_attention_dim,
-            attention_heads=fusion_attention_heads,
-            attention_layers=fusion_attention_layers,
-        )
+        self.fusion_module = TriModalFusion(reducer_dropout=fusion_dropout)
 
     def forward(
         self,
@@ -270,10 +257,6 @@ class CLIPGCNContrastiveModel(nn.Module):
         device=None,
         download_root: Optional[str] = None,
         fusion_dropout: float = 0.2,
-        fusion_reducer: str = "flatten_fc",
-        fusion_attention_dim: int = 256,
-        fusion_attention_heads: int = 4,
-        fusion_attention_layers: int = 2,
     ):
         super().__init__()
 
@@ -282,13 +265,7 @@ class CLIPGCNContrastiveModel(nn.Module):
             device=device,
             download_root=download_root,
         )
-        self.visual_encoder = TriModalModel(
-            fusion_dropout=fusion_dropout,
-            fusion_reducer=fusion_reducer,
-            fusion_attention_dim=fusion_attention_dim,
-            fusion_attention_heads=fusion_attention_heads,
-            fusion_attention_layers=fusion_attention_layers,
-        )
+        self.visual_encoder = TriModalModel(fusion_dropout=fusion_dropout)
         self.logit_scale = nn.Parameter(torch.ones([]) * torch.log(torch.tensor(1 / 0.07)))
         self.register_buffer("text_features", torch.empty(0, self.text_encoder.embed_dim), persistent=False)
         self.register_buffer("text_label_ids", torch.empty(0, dtype=torch.long), persistent=False)
@@ -349,18 +326,10 @@ def build_model(
     device=None,
     download_root: Optional[str] = None,
     fusion_dropout: float = 0.2,
-    fusion_reducer: str = "flatten_fc",
-    fusion_attention_dim: int = 256,
-    fusion_attention_heads: int = 4,
-    fusion_attention_layers: int = 2,
 ):
     return CLIPGCNContrastiveModel(
         text_model_name=text_model_name,
         device=device,
         download_root=download_root,
         fusion_dropout=fusion_dropout,
-        fusion_reducer=fusion_reducer,
-        fusion_attention_dim=fusion_attention_dim,
-        fusion_attention_heads=fusion_attention_heads,
-        fusion_attention_layers=fusion_attention_layers,
     )

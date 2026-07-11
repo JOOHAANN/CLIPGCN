@@ -12,6 +12,7 @@ import numpy as np
 import torch
 import torch.utils.data as Data
 from torch.utils.data import Dataset, Subset
+from torch.utils.data import WeightedRandomSampler
 
 from model import build_model, load_action_descriptions
 
@@ -124,6 +125,27 @@ def stratified_split_indices(labels, val_fraction, seed):
     return train_indices, val_indices
 
 
+def dataset_labels(dataset):
+    if isinstance(dataset, Subset):
+        base_labels = dataset_labels(dataset.dataset)
+        return np.asarray(base_labels)[np.asarray(dataset.indices, dtype=np.int64)]
+    if hasattr(dataset, "labels"):
+        return np.asarray(dataset.labels)
+    raise TypeError(f"Cannot extract labels from dataset type: {type(dataset).__name__}")
+
+
+def build_class_balanced_sampler(dataset):
+    labels = dataset_labels(dataset).astype(np.int64)
+    classes, counts = np.unique(labels, return_counts=True)
+    class_weights = {int(label): 1.0 / float(count) for label, count in zip(classes, counts)}
+    sample_weights = np.asarray([class_weights[int(label)] for label in labels], dtype=np.float64)
+    return WeightedRandomSampler(
+        weights=torch.as_tensor(sample_weights, dtype=torch.double),
+        num_samples=len(sample_weights),
+        replacement=True,
+    )
+
+
 def build_dataloaders(config, config_path):
     data_config = config["data"]
     loader_config = data_config["dataloader"]
@@ -153,10 +175,18 @@ def build_dataloaders(config, config_path):
         val_dataset = Subset(train_dataset, val_indices)
         train_dataset = Subset(train_dataset, train_indices)
 
+    train_sampler = None
+    train_shuffle = loader_config.get("train_shuffle", True)
+    if loader_config.get("class_balanced_sampling", False):
+        train_sampler = build_class_balanced_sampler(train_dataset)
+        train_shuffle = False
+        print("Using class-balanced sampling for the training loader.")
+
     train_loader = Data.DataLoader(
         train_dataset,
         batch_size=loader_config["batch_size"],
-        shuffle=loader_config.get("train_shuffle", True),
+        shuffle=train_shuffle,
+        sampler=train_sampler,
         num_workers=loader_config.get("num_workers", 4),
         pin_memory=loader_config.get("pin_memory", True),
         drop_last=loader_config.get("drop_last", True),
@@ -349,11 +379,26 @@ def train_model(model, train_loader, val_loader, config, config_path, device):
     use_amp = bool(config["runtime"].get("amp", False)) and device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     grad_clip_norm = train_config.get("grad_clip_norm", None)
+    early_stopping_patience = train_config.get("early_stopping_patience")
+    early_stopping_min_delta = float(train_config.get("early_stopping_min_delta", 0.0))
 
     best_model_wts = copy.deepcopy(model.state_dict())
     best_loss = float("inf")
     history = {"epoch": [], "train_loss": [], "val_loss": []}
     start_time = time.time()
+
+    work_dir = get_path_from_config(config_path, output_config["work_dir"])
+    os.makedirs(work_dir, exist_ok=True)
+    best_path = get_path_from_config(config_path, output_config["best_model"])
+    last_path = get_path_from_config(config_path, output_config["last_model"])
+    history_path = get_path_from_config(config_path, output_config["history"])
+    os.makedirs(os.path.dirname(best_path), exist_ok=True)
+    os.makedirs(os.path.dirname(last_path), exist_ok=True)
+    if early_stopping_patience is not None:
+        early_stopping_patience = int(early_stopping_patience)
+        if early_stopping_patience <= 0:
+            raise ValueError("early_stopping_patience must be positive when set.")
+    epochs_without_improvement = 0
 
     for epoch in range(epochs):
         print(f"Epoch {epoch + 1}/{epochs}")
@@ -379,25 +424,32 @@ def train_model(model, train_loader, val_loader, config, config_path, device):
         else:
             print(f"val_loss: {val_loss:.4f}")
 
-        if val_loss is not None and val_loss < best_loss:
+        if val_loss is not None and val_loss < best_loss - early_stopping_min_delta:
             best_loss = val_loss
             best_model_wts = copy.deepcopy(model.state_dict())
+            torch.save(best_model_wts, best_path)
+            epochs_without_improvement = 0
+            print(f"Best model updated at epoch {epoch + 1}: {best_path}")
+        elif val_loss is not None and early_stopping_patience is not None:
+            epochs_without_improvement += 1
+
+        torch.save(model.state_dict(), last_path)
+        with open(history_path, "w", encoding="utf-8") as handle:
+            json.dump(history, handle, indent=2)
 
         elapsed = time.time() - start_time
         print("Training Time {:.0f}m {:.0f}s".format(elapsed // 60, elapsed % 60))
 
-    work_dir = get_path_from_config(config_path, output_config["work_dir"])
-    os.makedirs(work_dir, exist_ok=True)
-
-    best_path = get_path_from_config(config_path, output_config["best_model"])
-    last_path = get_path_from_config(config_path, output_config["last_model"])
-    os.makedirs(os.path.dirname(best_path), exist_ok=True)
-    os.makedirs(os.path.dirname(last_path), exist_ok=True)
+        if early_stopping_patience is not None and epochs_without_improvement >= early_stopping_patience:
+            print(
+                f"Early stopping at epoch {epoch + 1}: "
+                f"no val_loss improvement for {early_stopping_patience} validation checks."
+            )
+            break
 
     torch.save(best_model_wts, best_path)
     torch.save(model.state_dict(), last_path)
 
-    history_path = get_path_from_config(config_path, output_config["history"])
     with open(history_path, "w", encoding="utf-8") as handle:
         json.dump(history, handle, indent=2)
 
@@ -457,10 +509,16 @@ def main():
     device = get_device(config["runtime"].get("device"))
     print_device_info(device)
 
+    fusion_config = config["model"].get("fusion", {})
     model = build_model(
         text_model_name=config["model"]["text_encoder"]["name"],
         device=device,
         download_root=get_path_from_config(config_path, config["model"]["text_encoder"].get("download_root")),
+        fusion_dropout=float(fusion_config.get("dropout", 0.2)),
+        fusion_reducer=fusion_config.get("reducer", "flatten_fc"),
+        fusion_attention_dim=int(fusion_config.get("attention_dim", 256)),
+        fusion_attention_heads=int(fusion_config.get("attention_heads", 4)),
+        fusion_attention_layers=int(fusion_config.get("attention_layers", 2)),
     )
     prepare_action_text_bank(model, config, config_path)
     model = model.to(device)
